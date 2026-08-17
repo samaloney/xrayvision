@@ -4,7 +4,7 @@ exclude = [
   ".git,",
   "__pycache__",
   "build",
-  "stixpy/version.py",
+  "xrayvison/version.py",
 ]
 
 [lint]

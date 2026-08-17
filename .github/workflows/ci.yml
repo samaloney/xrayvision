@@ -39,17 +39,7 @@ jobs:
       coverage: codecov-oidc
       toxdeps: tox-pypi-filter
       envs: |
-        - linux: py313-online
-
-  type_check:
-    uses: OpenAstronomy/github-actions-workflows/.github/workflows/tox.yml@v3  # zizmor: ignore[unpinned-uses]
-    with:
-      submodules: false
-      pytest: false
-      toxdeps: tox-pypi-filter
-      envs: |
-        - linux: mypy
-        - linux: pyright
+        - linux: py313
 
   sdist_verify:
     runs-on: ubuntu-latest
@@ -83,7 +73,7 @@ jobs:
         - linux: py314-devdeps
 
   docs:
-    needs: [test]
+    needs: [core]
     uses: OpenAstronomy/github-actions-workflows/.github/workflows/tox.yml@8c8bb6c6c962542921f993d47d26df38dccd50b1  # v3.0.2
     with:
       default_python: '3.13'
@@ -96,6 +86,41 @@ jobs:
           - graphviz
       envs: |
         - linux: build_docs
+
+  online:
+    if: "!startsWith(github.event.ref, 'refs/tags/v')"
+    needs: [docs]
+    uses: OpenAstronomy/github-actions-workflows/.github/workflows/tox.yml@8c8bb6c6c962542921f993d47d26df38dccd50b1  # v3.0.2
+    permissions:
+      id-token: write
+    with:
+      submodules: false
+      toxdeps: tox-pypi-filter
+      coverage: codecov-oidc
+      envs: |
+        - linux: build_docs-gallery
+          # Speed up CI builds by not building full nav tree
+          posargs: -D html_theme_options.collapse_navigation=True
+          pytest: false
+          cache-path: |
+            docs/_build/
+            docs/generated/
+            .tox/sample_data/
+          cache-key: docs-${{ github.run_id }}
+        - linux: py313-online
+          posargs: -n auto --dist loadgroup --color=yes
+
+  type_check:
+    uses: OpenAstronomy/github-actions-workflows/.github/workflows/tox.yml@8c8bb6c6c962542921f993d47d26df38dccd50b1  # v3.0.2
+    permissions:
+      id-token: write
+    with:
+      submodules: false
+      pytest: false
+      toxdeps: tox-pypi-filter
+      envs: |
+        - linux: mypy
+        - linux: pyright
 
   build_dists:
     # Build wheels on PRs only when labelled. Releases will only be published if tagged ^v.*
