@@ -23,7 +23,7 @@ if _version.is_postrelease:
 elif _version.is_devrelease:
     version = release = f"{_version.base_version}.dev{_version.dev}"
 is_development = _version.is_devrelease
-is_release = not(_version.is_prerelease or _version.is_devrelease)
+is_release = not (_version.is_prerelease or _version.is_devrelease)
 
 project = "xrayvisim"
 author = "Shane Maloney"
@@ -35,7 +35,7 @@ copyright = f"{datetime.datetime.now().year}, {author}"  # noqa: A001
 linkcheck_ignore = [
     r"https://anaconda.org",
     r"https://web.njit.edu/~gary/728/Lecture6.html",
-    r"https://github.com/.*#.*", # GitHub anchors are notoriously broken in linkcheck
+    r"https://github.com/.*#.*",  # GitHub anchors are notoriously broken in linkcheck
 ]
 
 # Wrap large function/method signatures
