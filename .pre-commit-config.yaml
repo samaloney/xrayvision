@@ -8,6 +8,9 @@ repos:
         types: [python]
         # Define here once and then reference using YAML anchor
         exclude: &exclude_dirs ^xrayvision/(data|extern)/
+      - id: ruff-format
+        types: [ python ]
+        exclude: *exclude_dirs
   - repo: https://github.com/PyCQA/isort
     rev: 9.0.0a3
     hooks:

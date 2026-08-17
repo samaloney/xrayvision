@@ -352,9 +352,7 @@ def ms_clean(
 
         # shifted = dirty_beam[xr, yr]
 
-        comp = strength * shift(
-            scale_kernels[:, :, max_scale], (max_x - map_center[0], max_y - map_center[1]), order=0
-        )
+        comp = strength * shift(scale_kernels[:, :, max_scale], (max_x - map_center[0], max_y - map_center[1]), order=0)
 
         # comp = strength * scale_kernels[xr, yr]
 

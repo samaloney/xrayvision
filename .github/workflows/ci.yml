@@ -98,15 +98,6 @@ jobs:
       toxdeps: tox-pypi-filter
       coverage: codecov-oidc
       envs: |
-        - linux: build_docs-gallery
-          # Speed up CI builds by not building full nav tree
-          posargs: -D html_theme_options.collapse_navigation=True
-          pytest: false
-          cache-path: |
-            docs/_build/
-            docs/generated/
-            .tox/sample_data/
-          cache-key: docs-${{ github.run_id }}
         - linux: py313-online
           posargs: -n auto --dist loadgroup --color=yes
 
