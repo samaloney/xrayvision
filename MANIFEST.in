@@ -6,7 +6,7 @@ exclude .cruft.json
 exclude .gitignore
 exclude .isort.cfg
 exclude .pre-commit-config.yaml
-exclude .readthedocs.yaml
+exclude .readthedocs.yml
 exclude .rtd-environment.yaml
 exclude .ruff.toml
 
@@ -15,6 +15,7 @@ prune .github
 prune build
 prune changelog
 global-exclude *.pyc *.o
+
 # This subpackage is only used in development checkouts
 # and should not be included in built tarballs
 prune xrayvision/_dev
