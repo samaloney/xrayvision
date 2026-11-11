@@ -133,8 +133,8 @@ def vis_wv(
     pixel = pixel_size[0].to_value(apu.arcsec / apu.pix)
 
     psi = _fiwt_spectra(n, nscales, pixel)
-    dirty_map = vis_to_image(vis, shape=shape, pixel_size=pixel_size).value
-    psf = vis_psf_image(vis, shape=shape, pixel_size=pixel_size).value
+    dirty_map: NDArray[np.float64] = vis_to_image(vis, shape=shape, pixel_size=pixel_size).value
+    psf: NDArray[np.float64] = vis_psf_image(vis, shape=shape, pixel_size=pixel_size).value
 
     # Flux constraint from the shortest baseline
     radius = np.hypot(vis.u, vis.v)
