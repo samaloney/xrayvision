@@ -116,7 +116,8 @@ def vis_wv(
     ``vis_wv.pro`` centres the PSF one pixel off the FFT origin, so its images are shifted one pixel down in x and y;
     here the PSF is centred correctly. Its finest wavelet band also falls to zero above ~:math:`\pi/4` arcsec\
     :sup:`-1`, so for pixels below ~0.9 arcsec the transform is no longer a frame; here that band is kept flat.
-    Otherwise the results agree.
+    Otherwise the results agree, except when the PSF sum is close to zero. In that case, the PSF and dirty map
+    share a normalization by the PSF peak to avoid amplifying cancellation error in their sums.
 
     References
     ----------
@@ -134,7 +135,6 @@ def vis_wv(
     psi = _fiwt_spectra(n, nscales, pixel)
     dirty_map = vis_to_image(vis, shape=shape, pixel_size=pixel_size).value
     psf = vis_psf_image(vis, shape=shape, pixel_size=pixel_size).value
-    psf_ft = fft2(ifftshift(psf / psf.sum()))
 
     # Flux constraint from the shortest baseline
     radius = np.hypot(vis.u, vis.v)
@@ -142,7 +142,17 @@ def vis_wv(
     unit = dc.unit
     dc = dc.value
 
-    dirty_map *= dc / dirty_map.sum()
+    psf_sum = psf.sum()
+    if abs(psf_sum) <= 1e-12 * np.abs(psf).sum():
+        # Missing zero-frequency data can make the signed PSF sum vanish.
+        # Use the same stable scale for the PSF and dirty map in that case.
+        scale = np.max(np.abs(psf))
+        psf = psf / scale
+        dirty_map = dirty_map / scale
+    else:
+        psf = psf / psf_sum
+        dirty_map *= dc / dirty_map.sum()
+    psf_ft = fft2(ifftshift(psf))
     dirty_ft = fft2(dirty_map)
     lipschitz = 2 * np.max(np.abs(psf_ft) ** 2)
 

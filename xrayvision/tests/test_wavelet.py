@@ -56,6 +56,31 @@ def test_vis_wv(gaussian_vis):
     assert dc <= wv_map.data.sum() < 1.1 * dc
 
 
+@pytest.mark.parametrize("include_dc", [True, False], ids=["with-dc", "without-dc"])
+def test_vis_wv_fourier_grid(include_dc):
+    # Complete Fourier-grid sampling gives an exact point-source reconstruction.
+    # Removing the zero-frequency sample makes the PSF sum zero; the flux
+    # constraint still supplies the missing information.
+    n, flux = 65, 100.0
+    frequencies = np.arange(-(n // 2), n // 2 + 1) / n
+    u, v = np.meshgrid(frequencies, frequencies)
+    selected = np.ones(u.shape, dtype=bool) if include_dc else (u**2 + v**2 > 0)
+    u, v = u[selected], v[selected]
+    # A point source one pixel right of centre has this analytic visibility.
+    unit = apu.Unit("ph cm-2 s-1")
+    vis = Visibilities(flux * np.exp(2j * np.pi * u) * unit, u / apu.arcsec, v / apu.arcsec)
+    shape = (n, n) * apu.pix
+    pixel_size = 1 * apu.arcsec / apu.pix
+    if not include_dc:
+        psf = vis_psf_image(vis, shape=shape, pixel_size=pixel_size)
+        assert_allclose(psf.value.sum(), 0, atol=1e-10)
+
+    image = vis_wv(vis, shape=shape, pixel_size=pixel_size, lam=0, map=False)
+    expected = np.zeros((n, n))
+    expected[n // 2, n // 2 + 1] = flux
+    assert_allclose(image.to_value(unit / apu.arcsec**2), expected, rtol=1e-6, atol=1e-8)
+
+
 @pytest.mark.idl
 @pytest.mark.parametrize(("pixel", "lam"), [(1.0, None), (2.0, None), (1.0, 0.001)])
 def test_vis_wv_idl(gaussian_vis, pixel, lam, monkeypatch):
