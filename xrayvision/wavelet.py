@@ -21,17 +21,103 @@ logger = get_logger(__name__, "DEBUG")
 
 
 def _meyer_aux(x: NDArray[np.float64]) -> NDArray[np.float64]:
+    r"""
+    Evaluate the polynomial transition function used by the Meyer spectra.
+
+    Parameters
+    ----------
+    x : numpy.ndarray
+        Transition coordinates, with any array shape. Values outside the
+        interval [0, 1] are mapped to the corresponding endpoint value.
+
+    Returns
+    -------
+    numpy.ndarray
+        Transition values with the same shape as ``x``. The result is zero
+        below zero, one above one, and follows the seventh-degree polynomial
+        on [0, 1].
+
+    Notes
+    -----
+    The transition polynomial is
+
+    .. math::
+
+        \nu(x) = 35x^4 - 84x^5 + 70x^6 - 20x^7.
+
+    See Also
+    --------
+    _meyer_scaling, _meyer_wavelet
+    """
     y = 35 * x**4 - 84 * x**5 + 70 * x**6 - 20 * x**7
     return np.where(x > 1, 1.0, np.where(x >= 0, y, 0.0))
 
 
 def _meyer_scaling(omega: NDArray[np.float64]) -> NDArray[np.float64]:
+    r"""
+    Evaluate the real, even Meyer scaling spectrum.
+
+    Parameters
+    ----------
+    omega : numpy.ndarray
+        Frequency coordinates in the Meyer frequency convention, with any
+        array shape. The response depends only on their absolute values.
+
+    Returns
+    -------
+    numpy.ndarray
+        Scaling-spectrum amplitudes with the same shape as ``omega``. The
+        response is one for :math:`|\omega| \leq \pi/4`, tapers to zero at
+        :math:`|\omega| = \pi/2`, and vanishes beyond that frequency.
+
+    Notes
+    -----
+    The scaling spectrum is
+
+    .. math::
+
+        \widehat{\phi}(\omega) =
+        \begin{cases}
+            1, & |\omega| < \pi/4, \\
+            \cos\!\left[\dfrac{\pi}{2}
+                \nu\!\left(\dfrac{4|\omega|}{\pi} - 1\right)\right],
+                & \pi/4 \leq |\omega| \leq \pi/2, \\
+            0, & |\omega| > \pi/2.
+        \end{cases}
+
+    Here :math:`\nu` is the transition function implemented by `_meyer_aux`.
+
+    See Also
+    --------
+    _meyer_aux, _meyer_wavelet, _fiwt_spectra
+    """
     x = np.abs(omega)
     fall = np.cos(np.pi / 2 * _meyer_aux(4 * x / np.pi - 1))
     return np.where(x < np.pi / 4, 1.0, np.where(x <= np.pi / 2, fall, 0.0))
 
 
 def _meyer_wavelet(omega: NDArray[np.float64]) -> NDArray[np.float64]:
+    r"""
+    Evaluate the real, even Meyer mother-wavelet spectrum.
+
+    Parameters
+    ----------
+    omega : numpy.ndarray
+        Frequency coordinates in the Meyer frequency convention, with any
+        array shape. The response depends only on their absolute values.
+
+    Returns
+    -------
+    numpy.ndarray
+        Wavelet-spectrum amplitudes with the same shape as ``omega``. The
+        response vanishes for :math:`|\omega| \leq \pi/4` and
+        :math:`|\omega| > \pi`, rising to one at :math:`|\omega| = \pi/2`
+        before tapering back to zero.
+
+    See Also
+    --------
+    _meyer_aux, _meyer_scaling, _fiwt_spectra
+    """
     x = np.abs(omega)
     rise = np.sin(np.pi / 2 * _meyer_aux(4 * x / np.pi - 1))
     fall = np.cos(np.pi / 2 * _meyer_aux(2 * x / np.pi - 1))
@@ -40,10 +126,44 @@ def _meyer_wavelet(omega: NDArray[np.float64]) -> NDArray[np.float64]:
 
 def _fiwt_spectra(n: int, nscales: int, pixel_size: float) -> NDArray[np.float64]:
     r"""
-    Return the 2D isotropic Meyer spectra, scaling function first, then one wavelet per scale :math:`a_j = 2^{-j}`.
+    Construct the spectra for a finite isotropic Meyer wavelet transform.
 
-    The spectra are ``ifftshift`` ed so they can multiply unshifted FFTs directly; together they form a Parseval
-    frame, :math:`\phi^2 + \sum_j \psi_j^2 = 1`.
+    Parameters
+    ----------
+    n : int
+        Odd side length of the square image, in pixels.
+    nscales : int
+        Positive number of wavelet scales. A separate scaling-function band
+        is included in addition to these wavelet bands.
+    pixel_size : float
+        Positive width of a square pixel, in arcseconds per pixel.
+
+    Returns
+    -------
+    numpy.ndarray
+        Real spectra with shape ``(nscales + 1, n, n)``. The first plane is
+        the scaling spectrum; the remaining planes are wavelet spectra at
+        scales :math:`a_j = 2^{-j}` for ``j`` from zero to ``nscales - 1``.
+        The frequency axes are in unshifted FFT order, with zero frequency
+        at index ``(0, 0)``.
+
+    Notes
+    -----
+    The spectra form a Parseval frame:
+
+    .. math::
+
+        \phi^2 + \sum_j \psi_j^2 = 1.
+
+    The finest band completes the squared amplitudes of all preceding
+    bands. This retains the frame property when small pixels extend the
+    sampled frequencies beyond the support of the original SSW finest band.
+    Applying ``ifftshift`` to the radial frequency grid allows the returned
+    spectra to multiply unshifted FFTs directly.
+
+    See Also
+    --------
+    _fiwt, _ifiwt
     """
     # Omega fixes the bands in arcsec^-1 independent of the pixel size
     omega = 2.0 ** (nscales - 1) / pixel_size
@@ -57,11 +177,71 @@ def _fiwt_spectra(n: int, nscales: int, pixel_size: float) -> NDArray[np.float64
 
 
 def _fiwt(image: NDArray[np.float64], psi: NDArray[np.float64]) -> NDArray[np.float64]:
-    # psi is real and even so the coefficients of a real image are real
+    r"""
+    Compute the finite isotropic wavelet coefficients of a real image.
+
+    Parameters
+    ----------
+    image : numpy.ndarray
+        Real image with shape ``(n, n)``.
+    psi : numpy.ndarray
+        Real, even spectra with shape ``(nscales + 1, n, n)``, in unshifted
+        FFT order, as returned by `_fiwt_spectra`.
+
+    Returns
+    -------
+    numpy.ndarray
+        Real coefficients with shape ``(nscales + 1, n, n)``. The first
+        plane contains scaling coefficients and the remaining planes contain
+        wavelet coefficients. Coefficients retain the numerical units of
+        ``image``.
+
+    Notes
+    -----
+    Each spectrum filters the image FFT independently. Its inverse FFT is
+    real because the input image is real and the spectra are real and even.
+    With spectra from `_fiwt_spectra`, the transform preserves the sum of
+    squared amplitudes, and `_ifiwt` reconstructs unmodified coefficients
+    to floating-point precision.
+
+    See Also
+    --------
+    _fiwt_spectra, _ifiwt
+    """
     return ifft2(psi * fft2(image)).real
 
 
 def _ifiwt(coeffs: NDArray[np.float64], psi: NDArray[np.float64]) -> NDArray[np.float64]:
+    r"""
+    Synthesize a real image from finite isotropic wavelet coefficients.
+
+    Parameters
+    ----------
+    coeffs : numpy.ndarray
+        Real scaling and wavelet coefficients with shape
+        ``(nscales + 1, n, n)``, ordered as in `_fiwt`.
+    psi : numpy.ndarray
+        Real, even spectra with the same shape as ``coeffs``, in unshifted
+        FFT order, as returned by `_fiwt_spectra`.
+
+    Returns
+    -------
+    numpy.ndarray
+        Reconstructed real image with shape ``(n, n)`` and the same numerical
+        units as ``coeffs``.
+
+    Notes
+    -----
+    The coefficient FFTs are multiplied by their corresponding spectra and
+    summed over the band axis before taking the inverse FFT. For the
+    Parseval frame returned by `_fiwt_spectra`, this is the adjoint of
+    `_fiwt` and exactly reconstructs unmodified coefficients up to
+    floating-point precision.
+
+    See Also
+    --------
+    _fiwt_spectra, _fiwt
+    """
     return ifft2((psi * fft2(coeffs)).sum(axis=0)).real
 
 
@@ -114,10 +294,10 @@ def vis_wv(
     Notes
     -----
     ``vis_wv.pro`` centres the PSF one pixel off the FFT origin, so its images are shifted one pixel down in x and y;
-    here the PSF is centred correctly. Its finest wavelet band also falls to zero above ~:math:`\pi/4` arcsec\
-    :sup:`-1`, so for pixels below ~0.9 arcsec the transform is no longer a frame; here that band is kept flat.
-    Otherwise the results agree, except when the PSF sum is close to zero. In that case, the PSF and dirty map
-    share a normalization by the PSF peak to avoid amplifying cancellation error in their sums.
+    here the PSF is centred correctly. Its finest wavelet band also falls to zero above ~ :math:`\pi/4` arcsec\
+    :sup:`-1`, so for pixels below ~0.9 arcsec the transform is no longer a frame here that band is kept flat.
+    Otherwise, the results agree, except when the PSF sum is close to zero. In that case, the PSF and dirty map
+    share a normalisation by the PSF peak to avoid amplifying cancellation error in their sums.
 
     References
     ----------
