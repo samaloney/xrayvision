@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 import numpy.typing as npt
-from scipy.integrate import quad_vec
+from scipy.integrate import quad, quad_vec
 from scipy.special import erf
 
 import astropy.units as u
@@ -36,6 +36,7 @@ _MIN_WEIGHT = 1e-8
 _MAX_FLUX_FRACTION = 0.999  # largest share of the total flux one word may take
 _MOVE_TOLERANCE = 1e-3  # smallest update, as a fraction of a word's maximum, that counts as a move
 _BATCH = 64  # candidate updates evaluated together
+_INTEGRATION_LIMIT = 8.0  # Gaussian tails beyond this many scaled widths contribute less than 3e-29
 
 
 @dataclass
@@ -252,8 +253,11 @@ def _in_view_volume(words: _Gaussians, shape: tuple[int, int], pixel: _Array) ->
     Notes
     -----
     Writing the word's exponent as :math:`-(aX^2 + 2bXY + cY^2)`, the integral over
-    :math:`X` is analytic (an error-function difference) the remaining integral over
-    :math:`Y` is done numerically for all words at once with `scipy.integrate.quad_vec`.
+    :math:`X` is analytic (an error-function difference). The remaining integral is
+    scaled by each word's marginal Y width, so narrow peaks cannot disappear between
+    quadrature samples. Negligible Gaussian tails are excluded before integrating
+    all words together with `scipy.integrate.quad_vec`. Extremely sharp conditional
+    X transitions are integrated separately with explicit breakpoints.
 
     SSW integrates over one field-of-view width starting at the first pixel centre,
     not the pixel edge, and uses the opposite sign of :math:`b` to its renderer. Both
@@ -269,20 +273,45 @@ def _in_view_volume(words: _Gaussians, shape: tuple[int, int], pixel: _Array) ->
     y0 = -(ny - 1) / 2 * dy - words.y
     height = ny * dy
     sx, sy, phi = words.sx, words.sy, words.phi
-    # Quadratic form of the rendered Gaussian is a X^2 + 2b XY + c Y^2, SSW integrates -b.
-    a = np.cos(phi) ** 2 / (2 * sx**2) + np.sin(phi) ** 2 / (2 * sy**2)
-    b = np.sin(2 * phi) * (1 / sy**2 - 1 / sx**2) / 4
-    c = np.sin(phi) ** 2 / (2 * sx**2) + np.cos(phi) ** 2 / (2 * sy**2)
-    root = np.sqrt(a)
-    scale = words.amp * height * np.sqrt(np.pi) / (2 * root)
+    cos, sin = np.cos(phi), np.sin(phi)
+    # Keep SSW's opposite cross-term sign to the rendered Gaussian.
+    root_a = np.sqrt(cos**2 / (2 * sx**2) + sin**2 / (2 * sy**2))
+    b = sin * cos * (1 / sy**2 - 1 / sx**2) / 2
+    # t = Y / (sqrt(2) * marginal_sigma_y). This form avoids cancellation in c-b^2/a.
+    y_scale = 1 / np.sqrt(2 * ((sx * sin) ** 2 + (sy * cos) ** 2))
+    cutoff = _INTEGRATION_LIMIT
+    lower = np.clip(y0 * y_scale, -cutoff, cutoff)
+    upper = np.clip((y0 + height) * y_scale, -cutoff, cutoff)
+    cross = b / (root_a * y_scale)
+    left, right = root_a * x0, root_a * x1
+    # Also bound the conditional X probability: its support can be much narrower
+    # than the marginal Y Gaussian for highly elongated, rotated words.
+    bound0 = np.divide(left - cutoff, cross, out=np.full_like(cross, -np.inf), where=cross != 0)
+    bound1 = np.divide(right + cutoff, cross, out=np.full_like(cross, np.inf), where=cross != 0)
+    lower = np.clip(np.maximum(lower, np.minimum(bound0, bound1)), -cutoff, cutoff)
+    upper = np.clip(np.minimum(upper, np.maximum(bound0, bound1)), -cutoff, cutoff)
+    width = np.maximum(upper - lower, 0)
+    scale = width / (2 * np.sqrt(np.pi))
 
     def integrand(s: float) -> _Array:
-        # Analytic x integral at Y = y0 + s * height, for all words at once.
-        y = y0 + s * height
-        inner = erf(root * x1 - b * y / root) - erf(root * x0 - b * y / root)
-        return np.asarray(scale * np.exp((b**2 / a - c) * y**2) * inner)
+        t = lower + s * width
+        inner = erf(right - cross * t) - erf(left - cross * t)
+        return np.asarray(scale * np.exp(-(t**2)) * inner)
 
-    return np.asarray(quad_vec(integrand, 0, 1, epsabs=1e-10, epsrel=1e-7, norm="max")[0])
+    volume = np.asarray(quad_vec(integrand, 0, 1, epsabs=1e-10, epsrel=1e-7, norm="max")[0])
+    # The default axis-ratio bound never takes this path. At extreme anisotropy,
+    # an erf transition can otherwise hide in a very thin boundary layer.
+    for i in np.flatnonzero(np.abs(cross) * width > 32):
+        transitions = (np.array([left[i], right[i]])[:, None] + np.array([-cutoff, -1, 0, 1, cutoff])) / cross[i]
+        points = (transitions.ravel() - lower[i]) / width[i]
+        points = points[(points > 0) & (points < 1)]
+
+        def scalar_integrand(s: float, i: int = int(i)) -> float:
+            t = lower[i] + s * width[i]
+            return float(scale[i] * np.exp(-(t**2)) * (erf(right[i] - cross[i] * t) - erf(left[i] - cross[i] * t)))
+
+        volume[i] = quad(scalar_integrand, 0, 1, points=points, epsabs=1e-10, epsrel=1e-7)[0]
+    return volume
 
 
 def _fourier(words: _Gaussians, uu: _Array, vv: _Array) -> _Array:
@@ -431,11 +460,13 @@ def _coordinate_descent(
     curvature = -2 * np.sum(basis**2, axis=1)
     x_max = total_flux * amp / viv
     x = np.zeros(len(amp))
-    x[:2] = x_max[:2] / 2  # start with the flux shared between the first two words
+    n_active = min(2, len(amp))
+    # Share the full flux between up to two words; filtering may leave only one.
+    if n_active:
+        x[:n_active] = x_max[:n_active] / n_active
     residual = x @ basis - target
     xsum = x.sum()
     active = x > 0
-    n_active = 2
 
     fractions = np.linspace(0.999, sparseness, _STAGES)
     with np.errstate(over="ignore", divide="ignore"):

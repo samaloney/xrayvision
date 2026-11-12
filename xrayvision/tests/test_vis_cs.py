@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
+from scipy.special import erf
 
 import astropy.units as u
 
@@ -295,3 +296,60 @@ def test_sole_active_word_keeps_flux_constraint(seed):
         transform, 10 * transform[:, -1], np.ones(6), words.amp, viv, 10.0, 0.5, 1000.0, 50, False
     )
     assert_allclose((weights * viv).sum(), 10, rtol=1e-12)
+
+
+@pytest.mark.parametrize("abort_numerical_issues", [False, True])
+def test_single_surviving_word_keeps_flux_constraint(source_vis, monkeypatch, abort_numerical_issues):
+    # Filtering removes the second word, leaving one word to carry all the flux.
+    words = _Gaussians(
+        x=np.array([5.0, 1000.0]),
+        y=np.array([-3.0, 1000.0]),
+        sx=np.full(2, 4.0),
+        sy=np.full(2, 4.0),
+        phi=np.zeros(2),
+    )
+    monkeypatch.setattr("xrayvision.vis_cs._random_words", lambda *args: words)
+    image = vis_cs(
+        source_vis,
+        total_flux=100 * u.ph,
+        n_components=2,
+        iterations=1,
+        abort_numerical_issues=abort_numerical_issues,
+        map=False,
+    )
+    # The retained source is far from the image boundary and resolved by the pixels.
+    assert np.all(np.isfinite(image))
+    assert_allclose(image.sum() * u.arcsec**2, 100 * u.ph, rtol=1e-6)
+
+
+@pytest.mark.parametrize("shape,pixel", [((65, 65), (10.0, 10.0)), ((513, 513), (4.0, 4.0)), ((47, 61), (20.0, 15.0))])
+def test_in_view_volume_resolves_narrow_peaks(shape, pixel):
+    # Include the reported missed peak, mixed widths, boundaries and wholly outside words.
+    ny, nx = shape
+    dy, dx = pixel
+    left, bottom = -(nx - 1) * dx / 2, -(ny - 1) * dy / 2
+    x = np.array([0.0, 5.0, left, left + nx * dx, left - 200.0, 15.0])
+    y = np.array([180.0, -40.0, bottom, bottom + ny * dy, bottom - 200.0, 11.0])
+    sigma = np.array([1.5, 1.5, 2.0, 2.0, 1.5, 60.0])
+    words = _Gaussians(x, y, sigma, sigma, np.zeros(len(x)))
+    # Independent analytic rectangle integral for circular Gaussians.
+    root = np.sqrt(2) * sigma
+    expected = (
+        0.25
+        * (erf((left + nx * dx - x) / root) - erf((left - x) / root))
+        * (erf((bottom + ny * dy - y) / root) - erf((bottom - y) / root))
+    )
+    assert_allclose(_in_view_volume(words, shape, np.array(pixel)), expected, atol=1e-10, rtol=1e-7)
+
+
+@pytest.mark.parametrize("ratio", [2.5, 40.0, 10000.0])
+@pytest.mark.parametrize("sign", [-1.0, 1.0])
+def test_rotated_gaussian_quadrant_volume(ratio, sign):
+    # A corner at the mean gives a known bivariate-normal quadrant probability.
+    shape = (129, 129)
+    pixel = np.full(2, 1.5 * ratio)
+    corner = -(shape[0] - 1) * pixel[0] / 2
+    words = _Gaussians(*(np.array([value]) for value in (corner, corner, 1.5, 1.5 * ratio, sign * np.pi / 4)))
+    rho = sign * (1 - ratio**2) / (1 + ratio**2)  # SSW's retained cross-term sign
+    expected = 0.25 + np.arcsin(rho) / (2 * np.pi)
+    assert_allclose(_in_view_volume(words, shape, pixel), expected, atol=1e-10, rtol=1e-7)
