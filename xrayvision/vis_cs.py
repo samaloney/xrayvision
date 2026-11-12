@@ -1,261 +1,574 @@
 """VIS-CS reconstruction using a sparse, adaptive Gaussian dictionary.
 
-Based on Felix, Bolzern & Battaglia (2017), ApJ 849, 10,
-https://doi.org/10.3847/1538-4357/aa8d1e, and SolarSoft VIS_CS 2.0.
+Based on :cite:t:`Felix2017_vis_cs` and SolarSoft implementation.
+
+Dictionary Gaussians ("words") have unit integrated flux and are positioned in arcsec
+about the image centre, so pixel centres are the ``generate_xy`` coordinates.
 """
 
 import warnings
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from numbers import Integral
 from typing import Any
 
 import numpy as np
 import numpy.typing as npt
-from scipy.integrate import quad
+from scipy.integrate import quad_vec
 from scipy.special import erf
 
 import astropy.units as u
 
+from sunpy.map import GenericMap, Map
+
+from xrayvision.imaging import generate_header, validate_and_expand_kwarg
+from xrayvision.transform import generate_xy
 from xrayvision.visibility import Visibilities
 
 __all__ = ["vis_cs"]
 
 _Array = npt.NDArray[Any]
 
+# Constants
+_STAGES = 8  # regularisation stages, from sparseness 0.999 down to the requested value
+_MAX_WORDS = 200  # strongest words kept from each generation
+_MIN_WEIGHT = 1e-8
+_MAX_FLUX_FRACTION = 0.999  # largest share of the total flux one word may take
+_MOVE_TOLERANCE = 1e-3  # smallest update, as a fraction of a word's maximum, that counts as a move
+_BATCH = 64  # candidate updates evaluated together
+
 
 @dataclass
-class _Dictionary:
-    # Native SSW coordinates: positions measured from the lower left of the FOV.
+class _Gaussians:
+    r"""
+    A dictionary of unit-flux elliptical Gaussians ("words").
+
+    Each word :math:`k` has integrated flux one and surface brightness
+
+    .. math::
+
+        g_k(x, y) = \frac{1}{2\pi\sigma_x\sigma_y}
+            \exp\left(-\frac{p^2}{2\sigma_x^2} - \frac{q^2}{2\sigma_y^2}\right),
+
+    where :math:`(p, q)` are the offsets from the word's centre rotated by
+    :math:`\phi` (see `principal`).
+
+    Attributes
+    ----------
+    x, y : numpy.ndarray
+        Centres in arcsec, relative to the image centre.
+    sx, sy : numpy.ndarray
+        Standard deviations along the word's principal axes, in arcsec.
+    phi : numpy.ndarray
+        Rotation angles of the principal axes, in radians.
+    """
+
     x: _Array
     y: _Array
     sx: _Array
     sy: _Array
     phi: _Array
-    amp: _Array
-    a: _Array
-    b: _Array
-    c: _Array
-    viv: _Array
 
-    def take(self, indices: Any) -> "_Dictionary":
-        return _Dictionary(**{key: value[indices] for key, value in vars(self).items()})
+    def __len__(self) -> int:
+        return len(self.x)
+
+    def __getitem__(self, index: Any) -> "_Gaussians":
+        return _Gaussians(*(getattr(self, f.name)[index] for f in fields(self)))
+
+    @classmethod
+    def concatenate(cls, parts: list["_Gaussians"]) -> "_Gaussians":
+        """
+        Join several dictionaries into one, preserving their order.
+
+        Parameters
+        ----------
+        parts : list of `_Gaussians`
+            Dictionaries to join.
+
+        Returns
+        -------
+        `_Gaussians`
+            The words of ``parts`` in sequence.
+        """
+        return cls(*(np.concatenate([getattr(part, f.name) for part in parts]) for f in fields(cls)))
+
+    @property
+    def amp(self) -> _Array:
+        r"""Peak surface brightness :math:`1 / (2\pi\sigma_x\sigma_y)` of each unit-flux word."""
+        return np.asarray(1 / (2 * np.pi * self.sx * self.sy))
+
+    def principal(self, x: _Array, y: _Array) -> tuple[_Array, _Array]:
+        r"""
+        Rotate offsets (or frequencies) into each word's principal axes.
+
+        Parameters
+        ----------
+        x, y : numpy.ndarray
+            Offsets in arcsec, or frequencies in 1/arcsec, broadcastable against the
+            words.
+
+        Returns
+        -------
+        p, q : numpy.ndarray
+            Components along the ``sx`` and ``sy`` axes,
+            :math:`p = x\cos\phi - y\sin\phi` and :math:`q = x\sin\phi + y\cos\phi`.
+        """
+        cos, sin = np.cos(self.phi), np.sin(self.phi)
+        return x * cos - y * sin, x * sin + y * cos
 
 
-def _dictionary(
-    x: _Array, y: _Array, sx: _Array, sy: _Array, phi: _Array, shape: tuple[int, int], pixel: _Array
-) -> _Dictionary:
-    """Construct normalized Gaussians and their continuous volume in the FOV."""
-    x, y, sx, sy, phi = (np.asarray(t, dtype=float) for t in (x, y, sx, sy, phi))
+def _random_words(
+    rng: np.random.Generator,
+    count: int,
+    shape: tuple[int, int],
+    pixel: _Array,
+    min_sigma: float,
+    max_sigma: float,
+    anisotropy: float,
+) -> _Gaussians:
+    r"""
+    Create random words.
+
+    Parameters
+    ----------
+    rng : numpy.random.Generator
+        Source of randomness.
+    count : int
+        Number of words to draw.
+    shape : tuple of int
+        Image shape ``(ny, nx)`` in pixels.
+    pixel : numpy.ndarray
+        Pixel size ``(dy, dx)`` in arcsec.
+    min_sigma, max_sigma : float
+        Limits of the standard deviations, in arcsec.
+    anisotropy : float
+        Largest allowed ratio between the two standard deviations of a word.
+
+    Returns
+    -------
+    `_Gaussians`
+        ``count`` words with centres uniform over the field of view.
+
+    Notes
+    -----
+    With :math:`r` uniform on :math:`[0, 1)`, the major width is
+    :math:`\sigma_x = \sigma_{\min} + r^2(\sigma_{\max} - \sigma_{\min})`, which favours
+    compact words. The other width is :math:`\sigma_x(1 + 0.25 z)` for a standard normal
+    :math:`z`, clipped to the anisotropy and sigma limits, and the angle is uniform on
+    :math:`[0, \pi/2)`.
+
+    See Also
+    --------
+    _refine
+    """
+    (ny, nx), (dy, dx) = shape, pixel
+    x, y, size, phi = rng.random((4, count))
+    sx = min_sigma + size**2 * (max_sigma - min_sigma)
+    sy = np.clip(sx * (1 + 0.25 * rng.standard_normal(count)), sx / anisotropy, sx * anisotropy)
+    return _Gaussians((x - 0.5) * nx * dx, (y - 0.5) * ny * dy, sx, np.clip(sy, min_sigma, max_sigma), phi * np.pi / 2)
+
+
+def _refine(
+    words: _Gaussians,
+    rng: np.random.Generator,
+    count: int,
+    shape: tuple[int, int],
+    pixel: _Array,
+    min_sigma: float,
+    max_sigma: float,
+    anisotropy: float,
+) -> _Gaussians:
+    r"""
+    Build the next generation's dictionary from the strongest words.
+
+    Parameters
+    ----------
+    words : `_Gaussians`
+        Strongest words of the previous generation, kept unchanged.
+    rng : numpy.random.Generator
+        Source of randomness.
+    count : int
+        Size of the new dictionary, at least ``len(words)``.
+    shape : tuple of int
+        Image shape ``(ny, nx)`` in pixels.
+    pixel : numpy.ndarray
+        Pixel size ``(dy, dx)`` in arcsec.
+    min_sigma, max_sigma : float
+        Limits of the standard deviations, in arcsec.
+    anisotropy : float
+        Largest allowed ratio between the two standard deviations of a word.
+
+    Returns
+    -------
+    `_Gaussians`
+        ``count`` words: ``words``, then perturbed copies of them filling up to about
+        half the dictionary, then new random words.
+
+    Notes
+    -----
+    Each copy is shifted by two pixels times a standard normal in each direction, has
+    each width scaled by ``1 + 0.4`` times a standard normal (then clipped to the
+    anisotropy and sigma limits), and is rotated by :math:`\pi/8` times a standard normal.
+
+    See Also
+    --------
+    _random_words
+    """
+    copies = max(0, (count // 2 - len(words)) // len(words))
+    old = words[np.tile(np.arange(len(words)), copies)]
+    shift_x, shift_y, grow_x, grow_y, turn = rng.standard_normal((5, len(old)))
+    sx = np.clip(old.sx * (1 + 0.4 * grow_x), old.sy / anisotropy, old.sy * anisotropy)
+    sy = np.clip(old.sy * (1 + 0.4 * grow_y), old.sx / anisotropy, old.sx * anisotropy)
+    variations = _Gaussians(
+        old.x + 2 * pixel[1] * shift_x,
+        old.y + 2 * pixel[0] * shift_y,
+        np.clip(sx, min_sigma, max_sigma),
+        np.clip(sy, min_sigma, max_sigma),
+        old.phi + np.pi / 8 * turn,
+    )
+    fill = _random_words(rng, count - len(words) - len(variations), shape, pixel, min_sigma, max_sigma, anisotropy)
+    return _Gaussians.concatenate([words, variations, fill])
+
+
+def _in_view_volume(words: _Gaussians, shape: tuple[int, int], pixel: _Array) -> _Array:
+    r"""
+    Integrate each unit-flux word over the field of view.
+
+    Parameters
+    ----------
+    words : `_Gaussians`
+        The dictionary.
+    shape : tuple of int
+        Image shape ``(ny, nx)`` in pixels.
+    pixel : numpy.ndarray
+        Pixel size ``(dy, dx)`` in arcsec.
+
+    Returns
+    -------
+    numpy.ndarray
+        In-view volume of each word: its flux inside the field of view, about one for
+        words well inside it and zero for words wholly outside.
+
+    Notes
+    -----
+    Writing the word's exponent as :math:`-(aX^2 + 2bXY + cY^2)`, the integral over
+    :math:`X` is analytic (an error-function difference) the remaining integral over
+    :math:`Y` is done numerically for all words at once with `scipy.integrate.quad_vec`.
+
+    SSW integrates over one field-of-view width starting at the first pixel centre,
+    not the pixel edge, and uses the opposite sign of :math:`b` to its renderer. Both
+    conventions are kept so the flux constraint matches SSW.
+
+    See Also
+    --------
+    _coordinate_descent
+    """
+    (ny, nx), (dy, dx) = shape, pixel
+    x0 = -(nx - 1) / 2 * dx - words.x
+    x1 = x0 + nx * dx
+    y0 = -(ny - 1) / 2 * dy - words.y
+    height = ny * dy
+    sx, sy, phi = words.sx, words.sy, words.phi
+    # Quadratic form of the rendered Gaussian is a X^2 + 2b XY + c Y^2, SSW integrates -b.
     a = np.cos(phi) ** 2 / (2 * sx**2) + np.sin(phi) ** 2 / (2 * sy**2)
-    b = -np.sin(2 * phi) / (4 * sx**2) + np.sin(2 * phi) / (4 * sy**2)
+    b = np.sin(2 * phi) * (1 / sy**2 - 1 / sx**2) / 4
     c = np.sin(phi) ** 2 / (2 * sx**2) + np.cos(phi) ** 2 / (2 * sy**2)
-    amp = 1 / (2 * np.pi * sx * sy)
-    ny, nx = shape
-    dx, dy = pixel
-    # Preserve SSW 2.0 integration bounds and its cross-term sign convention.
-    xlo = -0.5 + 0.5 * dx - x
-    xhi = nx * dx - 0.5 + 0.5 * dx - x
-    ylo = -0.5 + 0.5 * dy - y
-    yhi = ny * dy - 0.5 + 0.5 * dy - y
-    viv = np.empty(len(x))
-    for i in range(len(x)):
-        root = np.sqrt(a[i])
+    root = np.sqrt(a)
+    scale = words.amp * height * np.sqrt(np.pi) / (2 * root)
 
-        def integrand(t: float, i: int = i, root: float = root) -> float:
-            return float(
-                amp[i]
-                * np.sqrt(np.pi)
-                / (2 * root)
-                * np.exp((b[i] ** 2 / a[i] - c[i]) * t**2)
-                * (erf(root * xhi[i] - b[i] * t / root) - erf(root * xlo[i] - b[i] * t / root))
-            )
+    def integrand(s: float) -> _Array:
+        # Analytic x integral at Y = y0 + s * height, for all words at once.
+        y = y0 + s * height
+        inner = erf(root * x1 - b * y / root) - erf(root * x0 - b * y / root)
+        return np.asarray(scale * np.exp((b**2 / a - c) * y**2) * inner)
 
-        viv[i] = quad(integrand, ylo[i], yhi[i], epsabs=1e-10, epsrel=1e-7)[0]
-    if np.any(~np.isfinite(viv)) or np.any(viv <= np.finfo(float).tiny):
-        raise ValueError("Gaussian dictionary has zero or nonfinite volume in the field of view.")
-    return _Dictionary(x, y, sx, sy, phi, amp, a, b, c, viv)
+    return np.asarray(quad_vec(integrand, 0, 1, epsabs=1e-10, epsrel=1e-7, norm="max")[0])
 
 
-def _random_dictionary(
-    rng: np.random.Generator,
-    count: int,
-    shape: tuple[int, int],
-    pixel: _Array,
-    min_sigma: float,
-    max_sigma: float,
-    anisotropy: float,
-) -> _Dictionary:
-    ny, nx = shape
-    dx, dy = pixel
-    r = rng.random((count, 4))
-    sx = min_sigma + r[:, 2] ** 2 * (max_sigma - min_sigma)
-    sy = np.clip(sx + rng.standard_normal(count) * sx * 0.25, sx / anisotropy, sx * anisotropy)
-    sy = np.clip(sy, min_sigma, max_sigma)
-    return _dictionary(r[:, 0] * nx * dx, r[:, 1] * ny * dy, sx, sy, r[:, 3] * np.pi / 2, shape, pixel)
+def _fourier(words: _Gaussians, uu: _Array, vv: _Array) -> _Array:
+    r"""
+    Evaluate each word's visibilities analytically.
 
+    Parameters
+    ----------
+    words : `_Gaussians`
+        The dictionary.
+    uu, vv : numpy.ndarray
+        Spatial frequencies in 1/arcsec.
 
-def _refine_dictionary(
-    words: _Dictionary,
-    rng: np.random.Generator,
-    count: int,
-    shape: tuple[int, int],
-    pixel: _Array,
-    min_sigma: float,
-    max_sigma: float,
-    anisotropy: float,
-) -> _Dictionary:
-    nwords = len(words.x)
-    each = max(0, (count // 2 - nwords) // nwords)
-    parts = [words]
-    if each:
-        old = words.take(np.tile(np.arange(nwords), each))
-        r = rng.standard_normal((len(old.x), 5))
-        sx = np.clip(old.sx + r[:, 2] * old.sx * 0.4, old.sy / anisotropy, old.sy * anisotropy)
-        sy = np.clip(old.sy + r[:, 3] * old.sy * 0.4, old.sx / anisotropy, old.sx * anisotropy)
-        parts.append(
-            _dictionary(
-                old.x + r[:, 0] * 2 * pixel[0],
-                old.y + r[:, 1] * 2 * pixel[1],
-                np.clip(sx, min_sigma, max_sigma),
-                np.clip(sy, min_sigma, max_sigma),
-                old.phi + r[:, 4] * np.pi / 8,
-                shape,
-                pixel,
-            )
-        )
-    remaining = count - sum(len(part.x) for part in parts)
-    if remaining:
-        parts.append(_random_dictionary(rng, remaining, shape, pixel, min_sigma, max_sigma, anisotropy))
-    return _Dictionary(**{key: np.concatenate([getattr(part, key) for part in parts]) for key in vars(words)})
+    Returns
+    -------
+    numpy.ndarray
+        Complex array of shape ``(n_vis, n_words)``,
 
+        .. math::
 
-def _fourier(
-    dictionary: _Dictionary,
-    uu: _Array,
-    vv: _Array,
-    shape: tuple[int, int],
-    pixel: _Array,
-    phase_center: _Array | tuple[float, float] = (0.0, 0.0),
-) -> _Array:
-    """Analytic positive-sign Fourier transform, (visibility, dictionary word)."""
-    d = dictionary
+            V_{jk} = \exp\left(-2\pi^2(\sigma_x^2 p_{jk}^2 + \sigma_y^2 q_{jk}^2)
+                + 2\pi i (u_j x_k + v_j y_k)\right),
+
+        with :math:`(p, q)` the frequencies rotated into each word's principal axes.
+        The positive sign and the image-centre origin match `~xrayvision.transform.dft_map`.
+    """
     uu, vv = np.asarray(uu)[:, None], np.asarray(vv)[:, None]
-    ny, nx = shape
-    xc = d.x - (nx * pixel[0] - 1) / 2 + phase_center[0]
-    yc = d.y - (ny * pixel[1] - 1) / 2 + phase_center[1]
-    determinant = d.a * d.c - d.b**2
-    decay = -(np.pi**2) * (d.c * uu**2 - 2 * d.b * uu * vv + d.a * vv**2) / determinant
-    return np.asarray(np.exp(decay + 2j * np.pi * (uu * xc + vv * yc)))
+    p, q = words.principal(uu, vv)
+    decay = -2 * np.pi**2 * (words.sx**2 * p**2 + words.sy**2 * q**2)
+    phase = 2 * np.pi * (uu * words.x + vv * words.y)
+    return np.asarray(np.exp(decay + 1j * phase))
 
 
-def _render(dictionary: _Dictionary, weights: _Array, shape: tuple[int, int], pixel: _Array) -> _Array:
-    """Sample surface brightness at pixel centers in NumPy (y, x) order."""
-    ny, nx = shape
-    xx, yy = np.meshgrid(np.arange(nx) * pixel[0] - 0.5 + pixel[0] / 2, np.arange(ny) * pixel[1] - 0.5 + pixel[1] / 2)
+def _render(words: _Gaussians, weights: _Array, shape: tuple[int, int], pixel: _Array) -> _Array:
+    """
+    Sample the weighted sum of words at the pixel centres.
+
+    Parameters
+    ----------
+    words : `_Gaussians`
+        Words to render.
+    weights : numpy.ndarray
+        Integrated flux of each word.
+    shape : tuple of int
+        Image shape ``(ny, nx)`` in pixels.
+    pixel : numpy.ndarray
+        Pixel size ``(dy, dx)`` in arcsec.
+
+    Returns
+    -------
+    numpy.ndarray
+        Surface brightness (flux per square arcsec) of shape ``shape``, in NumPy
+        ``(y, x)`` order, at the `~xrayvision.transform.generate_xy` pixel centres.
+    """
+    y, x = (generate_xy(n * u.pix, pixel_size=d * u.arcsec / u.pix).to_value(u.arcsec) for n, d in zip(shape, pixel))
+    xx, yy = np.meshgrid(x, y)
     image = np.zeros(shape)
-    d = dictionary
     for i, weight in enumerate(weights):
-        x, y = xx - d.x[i], yy - d.y[i]
-        image += weight * d.amp[i] * np.exp(-(d.a[i] * x**2 + 2 * d.b[i] * x * y + d.c[i] * y**2))
+        word = words[i]
+        p, q = word.principal(xx - word.x, yy - word.y)
+        image += weight * word.amp * np.exp(-(p**2 / (2 * word.sx**2) + q**2 / (2 * word.sy**2)))
     return image
 
 
 def _coordinate_descent(
-    dictionary: _Dictionary,
     transform: _Array,
     observed: _Array,
     sigamp: _Array,
+    amp: _Array,
+    viv: _Array,
     total_flux: float,
     sparseness: float,
-    regularization: float,
+    regularisation: float,
     maxiter: int,
     abort_numerical_issues: bool,
 ) -> _Array:
-    """SSW 2.0 active-set coordinate descent with a hard continuous flux constraint."""
-    d = dictionary
-    # SSW intentionally weights by sqrt(SIGAMP), rather than SIGAMP.
-    sigma = np.sqrt(sigamp)
-    coeff = transform / sigma[:, None] / d.amp
-    target = observed / sigma
-    basis = np.ascontiguousarray(np.concatenate((coeff.real, coeff.imag), axis=0).T)
-    target = np.concatenate((target.real, target.imag))
-    ca = -2 * np.sum(basis**2, axis=1)
-    atf = total_flux * d.amp / d.viv
-    x = np.zeros(len(d.x))
-    x[:2] = atf[:2] * 0.5
+    r"""
+    Fit word weights by active-set coordinate descent.
+
+    Parameters
+    ----------
+    transform : numpy.ndarray
+        Complex visibilities of each unit-flux word, shape ``(n_vis, n_words)``.
+    observed : numpy.ndarray
+        Complex observed visibilities, shape ``(n_vis,)``.
+    sigamp : numpy.ndarray
+        Amplitude uncertainties, shape ``(n_vis,)``.
+    amp : numpy.ndarray
+        Peak surface brightness of each unit-flux word.
+    viv : numpy.ndarray
+        In-view volume of each word (see `_in_view_volume`), all positive.
+    total_flux : float
+        In-view flux the solution must carry.
+    sparseness : float
+        Final regularisation fraction in [0, 1).
+    regularisation : float
+        Penalty scale.
+    maxiter : int
+        Maximum sweeps per regularisation stage.
+    abort_numerical_issues : bool
+        Return zero weights on a singular or zero-curvature update in the final stage.
+
+    Returns
+    -------
+    numpy.ndarray
+        Integrated flux of each word -  mostly zeros.
+
+    Raises
+    ------
+    ValueError
+        If ``total_flux`` is too small for finite penalties.
+    FloatingPointError
+        If an update reaches a singular flux constraint and ``abort_numerical_issues``
+        is false.
+
+    Warns
+    -----
+    RuntimeWarning
+        If a stage does not converge within ``maxiter`` sweeps.
+
+    Notes
+    -----
+    The unknowns are peak brightnesses :math:`x_k = w_k A_k`. Each stage minimises
+
+    .. math::
+
+        \left\| \sum_k x_k b_k - t \right\|^2 + \lambda \sum_k x_k,
+        \qquad \text{subject to} \quad \sum_k x_k / x_k^{\max} = 1,
+        \quad x_k \geq 0,
+
+    where :math:`b_k` and :math:`t` are the real and imaginary parts of the word and
+    observed visibilities divided by :math:`\sqrt{\sigma}` (SSW weights by the square
+    root of SIGAMP) and :math:`b_k` also by :math:`A_k`, and
+    :math:`x_k^{\max} = F A_k / V_k` puts the whole in-view flux :math:`F` in word
+    :math:`k`. A Newton step updates one word at a time while rescaling the others to
+    keep the constraint, and no word may exceed 99.9% of its maximum.
+
+    The eight stages use :math:`\lambda = \text{regularisation}\, e^{1/F} f/(1 - f)`
+    for fractions :math:`f` from 0.999 down to ``sparseness``. Each stage alternates
+    full sweeps with sweeps over the active words until a full sweep moves nothing.
+    """
+    sigma = np.sqrt(sigamp)  # SSW intentionally weights by sqrt(SIGAMP), not SIGAMP
+    model = transform / sigma[:, None] / amp
+    basis = np.ascontiguousarray(np.concatenate((model.real, model.imag)).T)  # (word, 2 * nvis)
+    target = np.concatenate((observed.real, observed.imag)) / np.tile(sigma, 2)
+    curvature = -2 * np.sum(basis**2, axis=1)
+    x_max = total_flux * amp / viv
+    x = np.zeros(len(amp))
+    x[:2] = x_max[:2] / 2  # start with the flux shared between the first two words
     residual = x @ basis - target
     xsum = x.sum()
     active = x > 0
+    n_active = 2
 
-    for stage in range(8):
-        fraction = stage / 7
-        sp = fraction * sparseness + (1 - fraction) * 0.999
-        # Avoid an overflowing intermediate for extremely small total fluxes.
-        log_lambda = np.log(regularization) + 1 / total_flux + np.log(sp) - np.log1p(-sp) if sp else -np.inf
-        if log_lambda > np.log(np.finfo(float).max):
-            raise ValueError("Total flux is too small for the SSW VIS-CS regularization scale.")
-        penalty = np.exp(log_lambda)
-        active_only = False
-        for _sweep in range(maxiter):
-            moved = False
-            indices = np.flatnonzero(active) if active_only else range(len(x))
-            for i in indices:
-                xi = x[i]
-                gap = atf[i] - xi
-                if gap <= 0:
-                    newx = 0.0
-                    epsilon = np.zeros_like(target)
-                    bad = True
-                else:
-                    alpha = 1 / gap
-                    epsilon = (residual - basis[i] * xi + target) * alpha
-                    divisor = ca[i] + epsilon @ (4 * basis[i] - 2 * epsilon)
-                    bad = divisor == 0 or not np.isfinite(divisor)
-                    if bad:
-                        newx = 0.0
-                    else:
-                        newx = np.clip(
-                            (2 * residual @ (basis[i] - epsilon) - penalty * alpha * (xsum - xi) + penalty) / divisor
-                            + xi,
-                            0,
-                            atf[i] * 0.999,
-                        )
-                        bad = not np.isfinite(newx)
-                        if bad:
-                            newx = 0.0
-                if bad and abort_numerical_issues and stage == 7:
-                    return np.zeros_like(x)
-                delta = newx - xi
-                if ((newx == 0) != (xi == 0)) or abs(delta) > atf[i] * 0.001:
-                    if newx == 0 and xi != 0 and np.count_nonzero(active) < 2:
-                        continue
-                    if gap <= 0:
-                        raise FloatingPointError("VIS-CS reached a singular flux constraint.")
-                    active[i] = newx > 0
-                    residual += delta * (basis[i] - epsilon)
-                    x *= 1 - delta * alpha
-                    xsum = (1 - delta * alpha) * xsum - x[i] + newx
-                    x[i] = newx
-                    moved = True
-            if not moved:
-                if not active_only:
-                    break
-                active_only = False
-            else:
-                active_only = True
+    fractions = np.linspace(0.999, sparseness, _STAGES)
+    with np.errstate(over="ignore", divide="ignore"):
+        penalties = regularisation * np.exp(1 / np.float64(total_flux)) * fractions / (1 - fractions)
+    if not np.all(np.isfinite(penalties)):
+        raise ValueError("Total flux is too small for the regularisation scale.")
+
+    def sweep(indices: _Array, penalty: float, abort: bool) -> bool | None:
+        """Update ``indices`` in order, return whether any moved, or None to abort with zero weights.
+
+        Most candidate updates are rejected and leave the state unchanged, so candidates are
+        evaluated in batches up to the first accepted (or singular) one, which is applied
+        before evaluating the words after it.
+        """
+        nonlocal x, residual, xsum, n_active
+        moved, start = False, 0
+        for _ in range(len(indices)):  # each pass advances start by at least one
+            if start >= len(indices):
+                break
+            batch = indices[start : start + _BATCH]
+            b = basis[batch]
+            xi, limit = x[batch], x_max[batch]
+            gap = limit - xi
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                alpha = 1 / gap
+                epsilon = (residual - b * xi[:, None] + target) * alpha[:, None]
+                divisor = curvature[batch] + np.einsum("ij,ij->i", epsilon, 4 * b - 2 * epsilon)
+                gradient = 2 * (b - epsilon) @ residual + penalty * (1 - alpha * (xsum - xi))
+                newx = np.clip(gradient / divisor + xi, 0, _MAX_FLUX_FRACTION * limit)
+            singular = gap <= 0
+            # The flux constraint holds a sole active word at its maximum, where gap is only
+            # rounding: SSW then moves it by chance and breaks the constraint. Keep it fixed.
+            pinned = (xi > 0) & (n_active < 2)
+            solvable = ~singular & (divisor != 0) & np.isfinite(divisor) & np.isfinite(newx)
+            newx = np.where(solvable, newx, 0.0)
+            delta = newx - xi
+            moves = ~singular & ~pinned & (((newx == 0) != (xi == 0)) | (np.abs(delta) > _MOVE_TOLERANCE * limit))
+            stops = (singular | (divisor == 0) if abort else singular) & ~pinned
+            events = np.flatnonzero(moves | stops)
+            if not len(events):
+                start += len(batch)
+                continue
+            k = events[0]
+            if stops[k]:
+                if abort:
+                    return None
+                raise FloatingPointError("VIS-CS reached a singular flux constraint.")
+            i = batch[k]
+            n_active += int(newx[k] > 0) - int(xi[k] > 0)
+            active[i] = newx[k] > 0
+            residual += delta[k] * (b[k] - epsilon[k])
+            rescale = 1 - delta[k] * alpha[k]  # rescale the other words to keep the flux constraint
+            x *= rescale
+            xsum = rescale * xsum - x[i] + newx[k]
+            x[i] = newx[k]
+            moved, start = True, start + k + 1
+        return moved
+
+    for stage, penalty in enumerate(penalties):
+        abort = abort_numerical_issues and stage == _STAGES - 1
+        full_sweep = True
+        for _ in range(maxiter):
+            moved = sweep(np.arange(len(x)) if full_sweep else np.flatnonzero(active), penalty, abort)
+            if moved is None:
+                return np.zeros_like(x)
+            if full_sweep and not moved:
+                break
+            full_sweep = not moved  # after a productive sweep, revisit only the active words
         else:
-            warnings.warn("VIS-CS coordinate descent reached maxiter before convergence.", RuntimeWarning, stacklevel=2)
-    return x / d.amp
+            warnings.warn("VIS-CS coordinate descent reached maxiter before convergence.", RuntimeWarning, stacklevel=3)
+    return np.asarray(x / amp)
 
 
-def _pair(value: u.Quantity, unit: u.UnitBase, name: str) -> _Array:
-    pair = np.asarray(u.Quantity(value).to_value(unit), dtype=float)
-    if pair.ndim == 0:
-        pair = np.repeat(pair, 2)
-    if pair.shape != (2,) or np.any(~np.isfinite(pair)) or np.any(pair <= 0):
-        raise ValueError(f"{name} must contain one or two positive finite values.")
-    return pair
+def _strongest(weights: _Array) -> _Array:
+    """
+    Select the words kept from a generation.
+
+    Parameters
+    ----------
+    weights : numpy.ndarray
+        Integrated flux of each word.
+
+    Returns
+    -------
+    numpy.ndarray
+        Indices, in dictionary order, of weights above ``1e-8`` and above the 201st
+        largest weight, so at most 200 words.
+    """
+    limit = _MIN_WEIGHT
+    if len(weights) > _MAX_WORDS:
+        limit = max(limit, np.partition(weights, -_MAX_WORDS - 1)[-_MAX_WORDS - 1])
+    return np.flatnonzero(weights > limit)
+
+
+def _total_flux(vis: Visibilities, unit: u.UnitBase, nvis: int) -> float:
+    """
+    Estimate the total flux from per-visibility values in the metadata.
+
+    Parameters
+    ----------
+    vis : `~xrayvision.visibility.Visibilities`
+        Visibilities whose ``meta['totflux']`` holds one flux per visibility, with
+        optional ``meta['isc']`` detector labels.
+    unit : astropy.units.UnitBase
+        Visibility unit, quantities in ``meta['totflux']`` are converted to it.
+    nvis : int
+        Number of visibilities.
+
+    Returns
+    -------
+    float
+        The mean flux of each detector, averaged equally over detectors, or the plain
+        mean without detector labels.
+
+    Raises
+    ------
+    ValueError
+        If ``meta['totflux']`` is missing, has the wrong shape or holds nonpositive or
+        non-finite values, or ``meta['isc']`` has the wrong shape.
+    """
+    meta = vis.meta
+    if not isinstance(meta, Mapping) or "totflux" not in meta:
+        raise ValueError("Provide total_flux or vis.meta['totflux'], vis-cs requires a total-flux constraint.")
+    fluxes = meta["totflux"]
+    fluxes = np.asarray(fluxes.to_value(unit) if isinstance(fluxes, u.Quantity) else fluxes)
+    if fluxes.shape != (nvis,) or not np.all(np.isfinite(fluxes) & (fluxes > 0)):
+        raise ValueError("meta['totflux'] must contain one positive finite flux per visibility.")
+    if "isc" not in meta:
+        return float(fluxes.mean())
+    labels = np.asarray(meta["isc"])
+    if labels.shape != (nvis,):
+        raise ValueError("meta['isc'] must have one detector label per visibility.")
+    return float(np.mean([fluxes[labels == label].mean() for label in np.unique(labels)]))
 
 
 def vis_cs(
@@ -271,11 +584,12 @@ def vis_cs(
     min_sigma: u.Quantity = 1.5 * u.arcsec,
     max_sigma: u.Quantity = 60 * u.arcsec,
     max_anisotropy: float = 2.5,
-    regularization: float = 1000.0,
+    regularisation: float = 1000.0,
     maxiter: int = 1000,
     abort_numerical_issues: bool = False,
-) -> u.Quantity:
-    """Reconstruct visibilities with the SSW VIS-CS 2.0 Gaussian dictionary method.
+    map: bool = True,  # noqa: A002
+) -> u.Quantity | GenericMap:
+    """Reconstruct visibilities with the a gaussian dictionary method.
 
     Parameters
     ----------
@@ -292,54 +606,60 @@ def vis_cs(
         ``vis.meta['isc']`` detector first, then equally across detectors. Without
         detector labels the arithmetic mean of the flux array is used.
     sparseness : float, optional
-        Regularization fraction in [0, 1). Larger values favor fewer Gaussians.
+        Regularisation fraction in [0, 1). Larger values favor fewer Gaussians.
     seed : int or `~numpy.random.Generator`, optional
         Random state for repeatable dictionaries. NumPy and IDL random streams differ.
     n_components : int, optional
-        Number of dictionary words; defaults to ``max(2, 200000 // nvis)``.
+        Number of dictionary words=, defaults to ``max(2, 200000 // nvis)``.
     iterations : int, optional
         Dictionary generations, including the initial dictionary (default two).
     min_sigma, max_sigma : `~astropy.units.Quantity`, optional
-        Gaussian sigma limits. Defaults 1.5 and 60 arcsec follow installed SSW 2.0.
+        Gaussian sigma limits. Defaults 1.5 and 60 arcsec.
     max_anisotropy : float, optional
-        Axis-ratio bound (default 2.5); one gives circular Gaussians.
-    regularization : float, optional
-        SSW penalty scale (default 1000), applied to the numerical flux values in
+        Axis-ratio bound (default 2.5), one gives circular Gaussians.
+    regularisation : float, optional
+        Penalty scale (default 1000), applied to the numerical flux values in
         the input visibility unit. Use consistent flux units across comparisons.
     maxiter : int, optional
-        Maximum full/active-set sweeps per each of eight regularization stages.
+        Maximum full/active-set sweeps per each of eight regularisation stages.
         Emits a RuntimeWarning if a stage does not converge.
     abort_numerical_issues : bool, optional
-        Return zero coefficients for a singular final-stage update, as in SSW.
+        Return zero coefficients for a singular final-stage update.
+    map : bool, optional
+        Return a `sunpy.map.Map` (default) or a bare Quantity.
 
     Returns
     -------
-    image : `~astropy.units.Quantity`
+    image : `~sunpy.map.GenericMap` or `~astropy.units.Quantity`
         Nonnegative surface brightness in visibility units per square arcsecond.
-        Multiply by pixel area before using ``dft_map``. Output is sampled about
-        ``vis.phase_center`` (in ``(y, x)`` order) using the positive Fourier sign
-        of ``dft_map``.
+        Multiply by pixel area before using ``dft_map``. Visibilities are taken as
+        phased to ``vis.phase_center``, as ``image_to_vis`` produces and
+        ``vis_to_image`` assumes (and as RHESSI/STIX provide them), so the phase
+        centre only sets the map centre. Uses the positive Fourier sign of ``dft_map``.
 
     Notes
     -----
-    This follows the implementation of VIS-CS 2.0 shipped in SolarSoft, including
+    This follows the matches the convention of the vis-cs version in SSW, including
     sqrt(SIGAMP) weighting, eight sparsity stages, continuous in-view total-flux
     constraint, active-set descent, dictionary refinement and up-to-200-word pruning.
-    The paper describes sigma up to 40 arcsec; SSW uses 60 arcsec. NumPy uses a
+    The paper describes sigma up to 40 arcsec but SSW uses 60 arcsec. NumPy uses a
     different random generator and float64 rendering (SSW renders float32).
     Flux is constrained before pruning and continuous integration differs from
     summing pixel samples, so the returned pixel sum need not equal total_flux.
 
     References
     ----------
-    Felix, Bolzern & Battaglia (2017), ApJ 849, 10,
-    https://doi.org/10.3847/1538-4357/aa8d1e.
+    * :cite:t:`Felix2017_vis_cs`
     """
-    dims = _pair(shape, u.pix, "shape")
-    if np.any(dims != np.floor(dims)):
-        raise ValueError("shape must contain integer pixel counts.")
+    shape = validate_and_expand_kwarg(u.Quantity(shape), "shape")
+    dims = shape.to_value(u.pix)
+    if not (np.all(np.isfinite(dims)) and np.all(dims >= 1) and np.all(dims == np.round(dims))):
+        raise ValueError("shape must contain one or two positive integer pixel counts.")
     image_shape = (int(dims[0]), int(dims[1]))
-    pixel = _pair(pixel_size, u.arcsec / u.pix, "pixel_size")[::-1]
+    pixel_size = validate_and_expand_kwarg(u.Quantity(pixel_size), "pixel_size")
+    pixel = pixel_size.to_value(u.arcsec / u.pix)
+    if not np.all(np.isfinite(pixel) & (pixel > 0)):
+        raise ValueError("pixel_size must contain one or two positive finite values.")
     lo = u.Quantity(min_sigma).to_value(u.arcsec)
     hi = u.Quantity(max_sigma).to_value(u.arcsec)
     if np.ndim(lo) or np.ndim(hi) or not (0 < lo <= hi < np.inf):
@@ -348,76 +668,68 @@ def vis_cs(
         raise ValueError("sparseness must be in [0, 1).")
     if not np.isfinite(max_anisotropy) or max_anisotropy < 1:
         raise ValueError("max_anisotropy must be finite and at least one.")
-    if not np.isfinite(regularization) or regularization <= 0:
-        raise ValueError("regularization must be finite and positive.")
-    for name, value, minimum in (("iterations", iterations, 1), ("maxiter", maxiter, 1)):
-        if isinstance(value, bool) or not isinstance(value, Integral) or value < minimum:
+    if not np.isfinite(regularisation) or regularisation <= 0:
+        raise ValueError("regularisation must be finite and positive.")
+    for name, value in (("iterations", iterations), ("maxiter", maxiter)):
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
             raise ValueError(f"{name} must be a positive integer.")
+
     unit = vis.visibilities.unit
     observed = np.asarray(vis.visibilities.to_value(unit), dtype=complex)
     uu, vv = vis.u.to_value(1 / u.arcsec), vis.v.to_value(1 / u.arcsec)
-    uncertainty = vis.amplitude_uncertainty
-    if uncertainty is None:
+    if vis.amplitude_uncertainty is None:
         raise ValueError("VIS-CS requires amplitude uncertainties.")
-    sigamp = np.asarray(uncertainty.to_value(unit))
+    sigamp = np.asarray(vis.amplitude_uncertainty.to_value(unit))
     if observed.ndim != 1 or len(observed) < 2 or uu.shape != observed.shape or vv.shape != observed.shape:
         raise ValueError("VIS-CS requires at least two one-dimensional visibility samples.")
     if (
         sigamp.shape != observed.shape
         or np.iscomplexobj(sigamp)
         or np.any(sigamp <= 0)
-        or any(np.any(~np.isfinite(t)) for t in (observed, uu, vv, sigamp))
+        or not all(np.all(np.isfinite(t)) for t in (observed, uu, vv, sigamp))
     ):
         raise ValueError(
             "Visibilities and UV coordinates must be finite, with positive finite amplitude uncertainties."
         )
-    if total_flux is None:
-        meta = vis.meta
-        if not isinstance(meta, Mapping) or "totflux" not in meta:
-            raise ValueError("Provide total_flux or vis.meta['totflux']; VIS-CS requires a total-flux constraint.")
-        fluxes = meta["totflux"]
-        fluxes = np.asarray(fluxes.to_value(unit) if isinstance(fluxes, u.Quantity) else fluxes)
-        if fluxes.shape != observed.shape or np.any(~np.isfinite(fluxes)) or np.any(fluxes <= 0):
-            raise ValueError("meta['totflux'] must contain one positive finite flux per visibility.")
-        if "isc" in meta:
-            labels = np.asarray(meta["isc"])
-            if labels.shape != observed.shape:
-                raise ValueError("meta['isc'] must have one detector label per visibility.")
-            flux = np.mean([fluxes[labels == label].mean() for label in np.unique(labels)])
-        else:
-            flux = fluxes.mean()
-    else:
-        flux = u.Quantity(total_flux).to_value(unit)
+    flux = _total_flux(vis, unit, len(observed)) if total_flux is None else u.Quantity(total_flux).to_value(unit)
     if np.ndim(flux) or not np.isfinite(flux) or flux <= 0:
         raise ValueError("total_flux must be a positive finite scalar.")
     if n_components is None:
         n_components = max(2, 200000 // len(observed))
     if isinstance(n_components, bool) or not isinstance(n_components, Integral) or n_components < 2:
         raise ValueError("n_components must be an integer of at least two.")
-    center = np.asarray(vis.phase_center.to_value(u.arcsec))[::-1]
-    if center.shape != (2,) or np.any(~np.isfinite(center)):
-        raise ValueError("vis.phase_center must contain two finite angular coordinates.")
+
     rng = np.random.default_rng(seed)
-    dictionary = _random_dictionary(rng, n_components, image_shape, pixel, lo, hi, max_anisotropy)
+    words = _random_words(rng, n_components, image_shape, pixel, lo, hi, max_anisotropy)
+    image = np.zeros(image_shape)
     for generation in range(iterations):
-        transform = _fourier(dictionary, uu, vv, image_shape, pixel, center)
+        viv = _in_view_volume(words, image_shape, pixel)
+        # Perturbed copies can drift wholly out of view; they cannot carry in-view flux.
+        in_view = np.isfinite(viv) & (viv > 0)
+        words, viv = words[in_view], viv[in_view]
         weights = _coordinate_descent(
-            dictionary,
-            transform,
+            _fourier(words, uu, vv),
             observed,
             sigamp,
+            words.amp,
+            viv,
             float(flux),
             sparseness,
-            regularization,
+            regularisation,
             maxiter,
             abort_numerical_issues,
         )
-        limit = max(1e-8, np.partition(weights, -201)[-201]) if len(weights) > 200 else 1e-8
-        selected = np.flatnonzero(weights > limit)
-        if not len(selected):
-            return np.zeros(image_shape) * unit / u.arcsec**2
+        best = _strongest(weights)
+        if not len(best):
+            break
         if generation == iterations - 1:
-            return _render(dictionary.take(selected), weights[selected], image_shape, pixel) * unit / u.arcsec**2
-        dictionary = _refine_dictionary(
-            dictionary.take(selected), rng, n_components, image_shape, pixel, lo, hi, max_anisotropy
-        )
+            image = _render(words[best], weights[best], image_shape, pixel)
+            break
+        words = _refine(words[best], rng, n_components, image_shape, pixel, lo, hi, max_anisotropy)
+
+    brightness = unit / u.arcsec**2
+    if not map:
+        return image * brightness
+    header = generate_header(vis, shape=shape, pixel_size=pixel_size)
+    header["bunit"] = brightness.to_string("fits")
+    return Map((image, header))
