@@ -201,8 +201,8 @@ def _fiwt(image: NDArray[np.float64], psi: NDArray[np.float64]) -> NDArray[np.fl
     Each spectrum filters the image FFT independently. Its inverse FFT is
     real because the input image is real and the spectra are real and even.
     With spectra from `_fiwt_spectra`, the transform preserves the sum of
-    squared amplitudes, and `_ifiwt` reconstructs unmodified coefficients
-    to floating-point precision.
+    squared amplitudes, and `_ifiwt` reconstructs the image from unmodified
+    coefficients to floating-point precision.
 
     See Also
     --------
@@ -235,8 +235,8 @@ def _ifiwt(coeffs: NDArray[np.float64], psi: NDArray[np.float64]) -> NDArray[np.
     The coefficient FFTs are multiplied by their corresponding spectra and
     summed over the band axis before taking the inverse FFT. For the
     Parseval frame returned by `_fiwt_spectra`, this is the adjoint of
-    `_fiwt` and exactly reconstructs unmodified coefficients up to
-    floating-point precision.
+    `_fiwt` and exactly reconstructs the image from unmodified coefficients
+    up to floating-point precision.
 
     See Also
     --------
@@ -295,7 +295,7 @@ def vis_wv(
     -----
     ``vis_wv.pro`` centres the PSF one pixel off the FFT origin, so its images are shifted one pixel down in x and y;
     here the PSF is centred correctly. Its finest wavelet band also falls to zero above ~ :math:`\pi/4` arcsec\
-    :sup:`-1`, so for pixels below ~0.9 arcsec the transform is no longer a frame here that band is kept flat.
+    :sup:`-1`, so for pixels below ~0.9 arcsec the transform is no longer a frame; here that band is kept flat.
     Otherwise, the results agree, except when the PSF sum is close to zero. In that case, the PSF and dirty map
     share a normalisation by the PSF peak to avoid amplifying cancellation error in their sums.
 
